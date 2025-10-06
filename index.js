@@ -4,79 +4,76 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const path = require('path');
-
+const cookieParser = require('cookie-parser');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
-// near top, after express.json()
+app.use(cookieParser());
+
+// static + health (public)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-
-// Allowed origins (adjust to your frontend origins)
-const allowedOrigins = new Set([
-  'http://localhost:3000',
-  'http://127.0.0.1:3000'
-]);
-
-// Dynamic CORS options to support credentials and only allow whitelisted origins
-const corsOptions = {
-  origin: (origin, callback) => {
-    // Allow non-browser requests like curl/postman (origin === undefined)
-    if (!origin) return callback(null, true);
-
-    if (allowedOrigins.has(origin)) {
-      return callback(null, true);
-    } else {
-      return callback(new Error('CORS not allowed from ' + origin), false);
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  credentials: true, // <-- allows cookies/Authorization header with fetch credentials: 'include'
-  optionsSuccessStatus: 204
-};
-
-// Apply CORS middleware globally
-app.use(cors(corsOptions));
-
-// public auth routes (register + login)
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/rescues', require('./routes/rescues'));
-// public health check
 app.get('/', (req, res) => res.send('Server up'));
 
-// import auth middleware AFTER public routes
+// --- CORS (unchanged) ---
+const allowedOrigins = new Set(['http://localhost:3000','http://127.0.0.1:3000']);
+const corsOptions = {
+  origin: (origin, cb) => { if (!origin || allowedOrigins.has(origin)) return cb(null, true); cb(new Error('CORS not allowed from ' + origin), false); },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  credentials: true,
+  optionsSuccessStatus: 204
+};
+app.use(cors(corsOptions));
+
+// --- Public auth routes only ---
+app.use('/api/auth', require('./routes/auth')); // register/login(/me, /logout if you have them)
+
+// ---- Auth gate for everything else ----
 const { authenticateToken } = require('./middleware/auth');
 
-// protect everything below this line
-app.use(authenticateToken);
+/**
+ * Whitelist only these paths as public; everything else needs a valid JWT.
+ * Keep OPTIONS public so CORS preflight succeeds.
+ */
+app.use('/api/rescues', require('./routes/rescues'));
 
-// protected routes
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return next();
+
+  const publicMatchers = [
+    /^\/$/,                      // health
+    /^\/uploads(\/|$)/,          // static files
+    /^\/api\/auth(\/|$)/         // login/register/(me|logout)
+  ];
+
+  if (publicMatchers.some(rx => rx.test(req.path))) return next();
+
+  // everything else must be authenticated
+    return authenticateToken(req, res, next);
+});
+
+// ---- Protected routes (all of these now require JWT) ----
 app.use('/api/users', require('./routes/users'));
+app.use('/api/shelters', require('./routes/shelters'));
 
-// generic 404
+// 404 + error handler
 app.use((req, res) => res.status(404).json({ error: 'Resource/API/Route Not found' }));
-
-// error handler
 app.use((err, req, res, next) => {
+  // If your auth middleware sets 401/403, respect it:
+  if (err.name === 'UnauthorizedError' || err.status === 401) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// --- Mongo connect then start ---
+// --- Mongo connect then start (unchanged) ---
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
-if (!MONGO_URI) {
-  console.error('MONGO_URI / MONGODB_URI not set in .env');
-  process.exit(1);
-}
+if (!MONGO_URI) { console.error('MONGO_URI / MONGODB_URI not set in .env'); process.exit(1); }
 
-mongoose.connect(MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 10000 // increase if needed
-})
+mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true, serverSelectionTimeoutMS: 10000 })
   .then(() => {
     console.log('Mongo connected');
     app.listen(port, () => {
@@ -84,7 +81,4 @@ mongoose.connect(MONGO_URI, {
       console.log('Tip: set JWT_SECRET env variable in production.');
     });
   })
-  .catch(err => {
-    console.error('Mongo connection error:', err.message || err);
-    process.exit(1);
-  });
+  .catch(err => { console.error('Mongo connection error:', err.message || err); process.exit(1); });
